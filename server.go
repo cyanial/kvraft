@@ -1,8 +1,10 @@
 package kvraft
 
 import (
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cyanial/raft"
 	"github.com/cyanial/raft/labgob"
@@ -10,9 +12,11 @@ import (
 )
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Key         string
+	Value       string
+	Method      string
+	ClientId    int64
+	SequenceNum int64
 }
 
 type KVServer struct {
@@ -25,14 +29,100 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	store *KVStore
+
+	cmdCommitCh map[string]chan struct{}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+
+	cmd := Op{
+		Key:         args.Key,
+		Value:       "",
+		Method:      "Get",
+		ClientId:    args.ClientId,
+		SequenceNum: args.SequenceNum,
+	}
+
+	DPrintf("[Server %d] Get, k=%s -", kv.me, args.Key)
+	_, _, isLeader := kv.rf.Start(cmd)
+
+	if !isLeader {
+		DPrintf("[Server %d] Get, k=%s, - WrongLeader", kv.me, args.Key)
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	name := strconv.Itoa(int(args.ClientId)) + strconv.Itoa(int(args.SequenceNum))
+	cmdCommit := make(chan struct{})
+	kv.mu.Lock()
+	kv.cmdCommitCh[name] = cmdCommit
+	kv.mu.Unlock()
+
+	select {
+	case <-cmdCommit:
+		value, has := kv.store.Get(args.Key)
+		if has {
+			DPrintf("[Server %d] Get, k=%s, - OK", kv.me, args.Key)
+			reply.Err = OK
+			reply.Value = value
+		} else {
+			DPrintf("[Server %d] Get, k=%s, - No Key", kv.me, args.Key)
+			reply.Err = ErrNoKey
+			reply.Value = ""
+		}
+	case <-time.After(Server_TimeoutMS * time.Millisecond):
+		DPrintf("[Server %d] Get, k=%s, - Timeout", kv.me, args.Key)
+		reply.Err = ErrTimeout
+	}
+
+	kv.mu.Lock()
+	delete(kv.cmdCommitCh, name)
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+
+	cmd := Op{
+		Key:         args.Key,
+		Value:       args.Value,
+		Method:      args.Op,
+		ClientId:    args.ClientId,
+		SequenceNum: args.SequenceNum,
+	}
+
+	DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s -",
+		kv.me, args.Key, args.Value, args.Op)
+
+	_, _, isLeader := kv.rf.Start(cmd)
+	if !isLeader {
+		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - Wrong Leader",
+			kv.me, args.Key, args.Value, args.Op)
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	name := strconv.Itoa(int(args.ClientId)) + strconv.Itoa(int(args.SequenceNum))
+	cmdCommit := make(chan struct{})
+	kv.mu.Lock()
+	kv.cmdCommitCh[name] = cmdCommit
+	kv.mu.Unlock()
+
+	select {
+	case <-cmdCommit:
+		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - OK",
+			kv.me, args.Key, args.Value, args.Op)
+		reply.Err = OK
+	case <-time.After(Server_TimeoutMS * time.Millisecond):
+		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - Timeout",
+			kv.me, args.Key, args.Value, args.Op)
+		reply.Err = ErrTimeout
+	}
+
+	kv.mu.Lock()
+	delete(kv.cmdCommitCh, name)
+	kv.mu.Unlock()
+
 }
 
 //
@@ -56,6 +146,33 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) applier() {
+	for kv.killed() == false {
+		for applyMsg := range kv.applyCh {
+			if applyMsg.CommandValid {
+				cmd := applyMsg.Command.(Op)
+				DPrintf("[Server %d] applyMsg: m=%s", kv.me, cmd.Method)
+				switch cmd.Method {
+				case "Get":
+
+				case "Put":
+					kv.store.Put(cmd.Key, cmd.Value)
+				case "Append":
+					kv.store.Append(cmd.Key, cmd.Value)
+				}
+
+				name := strconv.Itoa(int(cmd.ClientId)) + strconv.Itoa(int(cmd.SequenceNum))
+				kv.mu.Lock()
+				ch, has := kv.cmdCommitCh[name]
+				if has {
+					ch <- struct{}{}
+				}
+				kv.mu.Unlock()
+			}
+		}
+	}
+}
+
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -75,16 +192,20 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
-	kv := new(KVServer)
+	kv := &KVServer{}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.store = MakeStore()
+	kv.cmdCommitCh = map[string]chan struct{}{}
 
-	// You may need initialization code here.
+	go kv.applier()
+
+	DPrintf("Init Server: %d", kv.me)
 
 	return kv
 }

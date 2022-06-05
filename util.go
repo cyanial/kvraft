@@ -4,6 +4,8 @@ import "log"
 
 const Debug = false
 
+const Server_TimeoutMS = 1000
+
 func init() {
 	log.SetFlags(log.Ltime)
 }
