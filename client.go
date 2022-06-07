@@ -13,10 +13,11 @@ import (
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 
-	mu          sync.Mutex
+	mu       sync.Mutex
+	leaderId int
+
 	clientId    int64
 	sequenceNum int64
-	leaderId    int
 }
 
 func nrand() int64 {
@@ -29,13 +30,15 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 
 	ck := &Clerk{}
+
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 
 	ck.servers = servers
+	ck.leaderId = 0
+
 	ck.clientId = nrand()
 	ck.sequenceNum = 0
-	ck.leaderId = 0
 
 	DPrintf("Init Clerk: %d", ck.clientId)
 
@@ -61,7 +64,6 @@ func (ck *Clerk) Get(key string) string {
 		ClientId:    ck.clientId,
 		SequenceNum: atomic.AddInt64(&ck.sequenceNum, 1),
 	}
-	reply := &GetReply{}
 
 	leaderId := ck.currentLeader()
 
@@ -69,12 +71,14 @@ func (ck *Clerk) Get(key string) string {
 
 		DPrintf("[Client %d, leader=%d] Get, k=%s - ", ck.clientId, leaderId, key)
 
+		reply := &GetReply{}
+
 		if ck.servers[leaderId].Call("KVServer.Get", args, reply) {
 			if reply.Err == OK {
 				DPrintf("[Client %d, leader=%d] Get, k=%s, v=%s - OK", ck.clientId, leaderId, key, reply.Value)
 				return reply.Value
 			} else if reply.Err == ErrNoKey {
-				DPrintf("[Client %d, leader=%d] Get, k=%s - No Key", ck.clientId, leaderId, key)
+				DPrintf("[Client %d, leader=%d] Get, k=%s, v=%s - No Key", ck.clientId, leaderId, key, "")
 				return ""
 			} else if reply.Err == ErrWrongLeader {
 				DPrintf("[Client %d, leader=%d] Get, k=%s - Wrong Leader", ck.clientId, leaderId, key)
@@ -85,7 +89,7 @@ func (ck *Clerk) Get(key string) string {
 		} else {
 			DPrintf("call KVServer.Get failed")
 		}
-		time.Sleep(1 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -108,7 +112,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ClientId:    ck.clientId,
 		SequenceNum: atomic.AddInt64(&ck.sequenceNum, 1),
 	}
-	reply := &PutAppendReply{}
 
 	leaderId := ck.currentLeader()
 
@@ -116,6 +119,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 		DPrintf("[Client %d, leader=%d] PutAppend, k=%s, v=%s, op=%s - ",
 			ck.clientId, leaderId, key, value, op)
+
+		reply := &PutAppendReply{}
 
 		if ck.servers[leaderId].Call("KVServer.PutAppend", args, reply) {
 			if reply.Err == OK {
@@ -133,7 +138,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		} else {
 			DPrintf("call KVServer.PutAppend failed")
 		}
-		time.Sleep(1 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

@@ -1,7 +1,6 @@
 package kvraft
 
 import (
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,14 +28,31 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	store *KVStore
+	// store *KVStore
+	store map[string]string
 
-	cmdCommitCh map[string]chan struct{}
+	waitApplyCh  map[int]chan Op
+	lastApplySeq map[int64]int64
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
-	cmd := Op{
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	DPrintf("[Server %d] Get, k=%s -", kv.me, args.Key)
+
+	_, isLeader := kv.rf.GetState()
+
+	if !isLeader {
+		DPrintf("[Server %d] Get, k=%s - Wrong Leader", kv.me, args.Key)
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
 		Key:         args.Key,
 		Value:       "",
 		Method:      "Get",
@@ -44,57 +60,79 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		SequenceNum: args.SequenceNum,
 	}
 
-	DPrintf("[Server %d] Get, k=%s -", kv.me, args.Key)
-	_, _, isLeader := kv.rf.Start(cmd)
+	index, _, _ := kv.rf.Start(op)
 
-	if !isLeader {
-		DPrintf("[Server %d] Get, k=%s, - WrongLeader", kv.me, args.Key)
-		reply.Err = ErrWrongLeader
-		return
-	}
-
-	name := strconv.Itoa(int(args.ClientId)) + strconv.Itoa(int(args.SequenceNum))
-	cmdCommit := make(chan struct{})
 	kv.mu.Lock()
-	kv.cmdCommitCh[name] = cmdCommit
+	indexCh, exist := kv.waitApplyCh[index]
+	if !exist {
+		kv.waitApplyCh[index] = make(chan Op)
+		indexCh = kv.waitApplyCh[index]
+	}
 	kv.mu.Unlock()
+
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.waitApplyCh, index)
+		kv.mu.Unlock()
+		close(indexCh)
+	}()
 
 	select {
-	case <-cmdCommit:
-		value, has := kv.store.Get(args.Key)
-		if has {
-			DPrintf("[Server %d] Get, k=%s, - OK", kv.me, args.Key)
-			reply.Err = OK
-			reply.Value = value
+	case commitOp := <-indexCh:
+		if commitOp.ClientId == op.ClientId && commitOp.SequenceNum == op.SequenceNum {
+			kv.mu.Lock()
+			// value, has := kv.store.Get(op.Key)
+			value, has := kv.store[op.Key]
+			kv.lastApplySeq[op.ClientId] = op.SequenceNum
+			kv.mu.Unlock()
+			if has {
+				DPrintf("[Server %d] Get, k=%s - OK", kv.me, args.Key)
+				reply.Err = OK
+				reply.Value = value
+			} else {
+				DPrintf("[Server %d] Get, k=%s - No Key", kv.me, args.Key)
+				reply.Err = ErrNoKey
+				reply.Value = ""
+			}
 		} else {
-			DPrintf("[Server %d] Get, k=%s, - No Key", kv.me, args.Key)
-			reply.Err = ErrNoKey
-			reply.Value = ""
+			reply.Err = ErrWrongLeader
 		}
-	case <-time.After(Server_TimeoutMS * time.Millisecond):
-		DPrintf("[Server %d] Get, k=%s, - Timeout", kv.me, args.Key)
-		reply.Err = ErrTimeout
-	}
+	case <-time.After(Server_Timeout):
+		DPrintf("[Server %d] Get, k=%s - Timeout", kv.me, args.Key)
 
-	kv.mu.Lock()
-	delete(kv.cmdCommitCh, name)
-	kv.mu.Unlock()
+		_, isLeader := kv.rf.GetState()
+		if kv.isDuplicatedCmd(op.ClientId, op.SequenceNum) && isLeader {
+			kv.mu.Lock()
+			// value, has := kv.store.Get(op.Key)
+			value, has := kv.store[op.Key]
+			kv.lastApplySeq[op.ClientId] = op.SequenceNum
+			kv.mu.Unlock()
+
+			if has {
+				reply.Err = OK
+				reply.Value = value
+			} else {
+				reply.Err = ErrNoKey
+				reply.Value = ""
+			}
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
-	cmd := Op{
-		Key:         args.Key,
-		Value:       args.Value,
-		Method:      args.Op,
-		ClientId:    args.ClientId,
-		SequenceNum: args.SequenceNum,
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
 	}
 
 	DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s -",
 		kv.me, args.Key, args.Value, args.Op)
 
-	_, _, isLeader := kv.rf.Start(cmd)
+	_, isLeader := kv.rf.GetState()
+
 	if !isLeader {
 		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - Wrong Leader",
 			kv.me, args.Key, args.Value, args.Op)
@@ -102,26 +140,49 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	name := strconv.Itoa(int(args.ClientId)) + strconv.Itoa(int(args.SequenceNum))
-	cmdCommit := make(chan struct{})
-	kv.mu.Lock()
-	kv.cmdCommitCh[name] = cmdCommit
-	kv.mu.Unlock()
-
-	select {
-	case <-cmdCommit:
-		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - OK",
-			kv.me, args.Key, args.Value, args.Op)
-		reply.Err = OK
-	case <-time.After(Server_TimeoutMS * time.Millisecond):
-		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - Timeout",
-			kv.me, args.Key, args.Value, args.Op)
-		reply.Err = ErrTimeout
+	op := Op{
+		Key:         args.Key,
+		Value:       args.Value,
+		Method:      args.Op,
+		ClientId:    args.ClientId,
+		SequenceNum: args.SequenceNum,
 	}
 
+	index, _, _ := kv.rf.Start(op)
+
 	kv.mu.Lock()
-	delete(kv.cmdCommitCh, name)
+	indexCh, exist := kv.waitApplyCh[index]
+	if !exist {
+		kv.waitApplyCh[index] = make(chan Op)
+		indexCh = kv.waitApplyCh[index]
+	}
 	kv.mu.Unlock()
+
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.waitApplyCh, index)
+		kv.mu.Unlock()
+		close(indexCh)
+	}()
+
+	select {
+	case commitOp := <-indexCh:
+		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - OK",
+			kv.me, args.Key, args.Value, args.Op)
+		if commitOp.ClientId == op.ClientId && commitOp.SequenceNum == op.SequenceNum {
+			reply.Err = OK
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	case <-time.After(Server_Timeout):
+		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - Wrong Leader",
+			kv.me, args.Key, args.Value, args.Op)
+		if kv.isDuplicatedCmd(op.ClientId, op.SequenceNum) {
+			reply.Err = OK
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	}
 
 }
 
@@ -148,26 +209,50 @@ func (kv *KVServer) killed() bool {
 
 func (kv *KVServer) applier() {
 	for kv.killed() == false {
-		for applyMsg := range kv.applyCh {
-			if applyMsg.CommandValid {
-				cmd := applyMsg.Command.(Op)
-				DPrintf("[Server %d] applyMsg: m=%s", kv.me, cmd.Method)
-				switch cmd.Method {
-				case "Get":
 
-				case "Put":
-					kv.store.Put(cmd.Key, cmd.Value)
-				case "Append":
-					kv.store.Append(cmd.Key, cmd.Value)
+		select {
+		case applyMsg := <-kv.applyCh:
+
+			switch {
+			case applyMsg.CommandValid:
+
+				op := applyMsg.Command.(Op)
+				if !kv.isDuplicatedCmd(op.ClientId, op.SequenceNum) {
+					switch op.Method {
+					case "Get":
+
+					case "Put":
+						DPrintf("[Server %d] Put, apply k=%v, v=%v",
+							kv.me, op.Key, op.Value)
+
+						kv.mu.Lock()
+						// kv.store.Put(op.Key, op.Value)
+						kv.store[op.Key] = op.Value
+						kv.lastApplySeq[op.ClientId] = op.SequenceNum
+						kv.mu.Unlock()
+					case "Append":
+						DPrintf("[Server %d] Append, apply k=%v, v=%v",
+							kv.me, op.Key, op.Value)
+
+						kv.mu.Lock()
+						// kv.store.Append(op.Key, op.Value)
+						kv.store[op.Key] += op.Value
+						kv.lastApplySeq[op.ClientId] = op.SequenceNum
+						kv.mu.Unlock()
+					}
 				}
 
-				name := strconv.Itoa(int(cmd.ClientId)) + strconv.Itoa(int(cmd.SequenceNum))
+				// reply
+				DPrintf("[Server %d] %v, apply OK",
+					kv.me, op.Method)
 				kv.mu.Lock()
-				ch, has := kv.cmdCommitCh[name]
-				if has {
-					ch <- struct{}{}
+				indexCh, exist := kv.waitApplyCh[applyMsg.CommandIndex]
+				if exist {
+					indexCh <- op
 				}
 				kv.mu.Unlock()
+			case applyMsg.SnapshotValid:
+				DPrintf("[Server %d] snapshot", kv.me)
 			}
 		}
 	}
@@ -193,6 +278,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	labgob.Register(Op{})
 
 	kv := &KVServer{}
+
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
@@ -200,8 +286,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.store = MakeStore()
-	kv.cmdCommitCh = map[string]chan struct{}{}
+	// kv.store = MakeStore()
+	kv.store = make(map[string]string)
+	kv.waitApplyCh = make(map[int]chan Op)
+	kv.lastApplySeq = make(map[int64]int64)
 
 	go kv.applier()
 
