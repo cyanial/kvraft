@@ -5,7 +5,6 @@ import (
 	"math/big"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/cyanial/raft/labrpc"
 )
@@ -31,8 +30,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 
 	ck := &Clerk{}
 
-	ck.mu.Lock()
-	defer ck.mu.Unlock()
+	// ck.mu.Lock()
+	// defer ck.mu.Unlock()
 
 	ck.servers = servers
 	ck.leaderId = 0
@@ -74,22 +73,13 @@ func (ck *Clerk) Get(key string) string {
 		reply := &GetReply{}
 
 		if ck.servers[leaderId].Call("KVServer.Get", args, reply) {
-			if reply.Err == OK {
+			if reply.Err == OK || reply.Err == ErrNoKey {
 				DPrintf("[Client %d, leader=%d] Get, k=%s, v=%s - OK", ck.clientId, leaderId, key, reply.Value)
 				return reply.Value
-			} else if reply.Err == ErrNoKey {
-				DPrintf("[Client %d, leader=%d] Get, k=%s, v=%s - No Key", ck.clientId, leaderId, key, "")
-				return ""
-			} else if reply.Err == ErrWrongLeader {
-				DPrintf("[Client %d, leader=%d] Get, k=%s - Wrong Leader", ck.clientId, leaderId, key)
-				leaderId = ck.changeLeader()
-			} else {
-				DPrintf("[Client %d, leader=%d] Get, k=%s - other: %v", ck.clientId, leaderId, key, reply.Err)
 			}
-		} else {
-			DPrintf("call KVServer.Get failed")
 		}
-		time.Sleep(10 * time.Millisecond)
+		DPrintf("[Client %d, leader=%d] Get, k=%s - Wrong Leader", ck.clientId, leaderId, key)
+		leaderId = ck.changeLeader()
 	}
 }
 
@@ -127,18 +117,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				DPrintf("[Client %d, leader=%d] PutAppend, k=%s, v=%s, op=%s - OK ",
 					ck.clientId, leaderId, key, value, op)
 				return
-			} else if reply.Err == ErrWrongLeader {
-				DPrintf("[Client %d, leader=%d] PutAppend, k=%s, v=%s, op=%s - Wrong Leader",
-					ck.clientId, leaderId, key, value, op)
-				leaderId = ck.changeLeader()
-			} else {
-				DPrintf("[Client %d, leader=%d] PutAppend, k=%s, v=%s, op=%s - other: %v",
-					ck.clientId, leaderId, key, value, op, reply.Err)
 			}
-		} else {
-			DPrintf("call KVServer.PutAppend failed")
 		}
-		time.Sleep(10 * time.Millisecond)
+
+		DPrintf("[Client %d, leader=%d] PutAppend, k=%s, v=%s, op=%s - Wrong Leader",
+			ck.clientId, leaderId, key, value, op)
+		leaderId = ck.changeLeader()
 	}
 }
 
