@@ -65,23 +65,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	indexCh, exist := kv.waitApplyCh[index]
 	if !exist {
-		kv.waitApplyCh[index] = make(chan Op)
-		indexCh = kv.waitApplyCh[index]
+		indexCh = make(chan Op)
+		kv.waitApplyCh[index] = indexCh
 	}
 	kv.mu.Unlock()
-
-	defer func() {
-		kv.mu.Lock()
-		delete(kv.waitApplyCh, index)
-		kv.mu.Unlock()
-		close(indexCh)
-	}()
 
 	select {
 	case commitOp := <-indexCh:
 		if commitOp.ClientId == op.ClientId && commitOp.SequenceNum == op.SequenceNum {
 			kv.mu.Lock()
-			// value, has := kv.store.Get(op.Key)
 			value, has := kv.store[op.Key]
 			kv.lastApplySeq[op.ClientId] = op.SequenceNum
 			kv.mu.Unlock()
@@ -103,7 +95,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		_, isLeader := kv.rf.GetState()
 		if kv.isDuplicatedCmd(op.ClientId, op.SequenceNum) && isLeader {
 			kv.mu.Lock()
-			// value, has := kv.store.Get(op.Key)
 			value, has := kv.store[op.Key]
 			kv.lastApplySeq[op.ClientId] = op.SequenceNum
 			kv.mu.Unlock()
@@ -119,6 +110,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			reply.Err = ErrWrongLeader
 		}
 	}
+
+	kv.mu.Lock()
+	delete(kv.waitApplyCh, index)
+	kv.mu.Unlock()
+	close(indexCh)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -153,17 +149,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	indexCh, exist := kv.waitApplyCh[index]
 	if !exist {
-		kv.waitApplyCh[index] = make(chan Op)
-		indexCh = kv.waitApplyCh[index]
+		indexCh = make(chan Op)
+		kv.waitApplyCh[index] = indexCh
 	}
 	kv.mu.Unlock()
-
-	defer func() {
-		kv.mu.Lock()
-		delete(kv.waitApplyCh, index)
-		kv.mu.Unlock()
-		close(indexCh)
-	}()
 
 	select {
 	case commitOp := <-indexCh:
@@ -184,6 +173,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 	}
 
+	kv.mu.Lock()
+	delete(kv.waitApplyCh, index)
+	kv.mu.Unlock()
+	close(indexCh)
 }
 
 //
@@ -219,14 +212,13 @@ func (kv *KVServer) applier() {
 				op := applyMsg.Command.(Op)
 				if !kv.isDuplicatedCmd(op.ClientId, op.SequenceNum) {
 					switch op.Method {
-					case "Get":
+					// case "Get":
 
 					case "Put":
 						DPrintf("[Server %d] Put, apply k=%v, v=%v",
 							kv.me, op.Key, op.Value)
 
 						kv.mu.Lock()
-						// kv.store.Put(op.Key, op.Value)
 						kv.store[op.Key] = op.Value
 						kv.lastApplySeq[op.ClientId] = op.SequenceNum
 						kv.mu.Unlock()
@@ -235,7 +227,6 @@ func (kv *KVServer) applier() {
 							kv.me, op.Key, op.Value)
 
 						kv.mu.Lock()
-						// kv.store.Append(op.Key, op.Value)
 						kv.store[op.Key] += op.Value
 						kv.lastApplySeq[op.ClientId] = op.SequenceNum
 						kv.mu.Unlock()
@@ -247,10 +238,10 @@ func (kv *KVServer) applier() {
 					kv.me, op.Method)
 				kv.mu.Lock()
 				indexCh, exist := kv.waitApplyCh[applyMsg.CommandIndex]
+				kv.mu.Unlock()
 				if exist {
 					indexCh <- op
 				}
-				kv.mu.Unlock()
 			case applyMsg.SnapshotValid:
 				DPrintf("[Server %d] snapshot", kv.me)
 			}
@@ -286,10 +277,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	// kv.store = MakeStore()
-	kv.store = make(map[string]string)
-	kv.waitApplyCh = make(map[int]chan Op)
-	kv.lastApplySeq = make(map[int64]int64)
+	kv.store = make(map[string]string, 1000)
+	kv.waitApplyCh = make(map[int]chan Op, 1000)
+	kv.lastApplySeq = make(map[int64]int64, 1000)
 
 	go kv.applier()
 
