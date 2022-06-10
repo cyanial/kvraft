@@ -28,11 +28,12 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	// store *KVStore
 	store map[string]string
 
 	waitApplyCh  map[int]chan Op
 	lastApplySeq map[int64]int64
+
+	snapshotIndex int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -44,14 +45,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	DPrintf("[Server %d] Get, k=%s -", kv.me, args.Key)
 
-	_, isLeader := kv.rf.GetState()
-
-	if !isLeader {
-		DPrintf("[Server %d] Get, k=%s - Wrong Leader", kv.me, args.Key)
-		reply.Err = ErrWrongLeader
-		return
-	}
-
 	op := Op{
 		Key:         args.Key,
 		Value:       "",
@@ -60,13 +53,19 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		SequenceNum: args.SequenceNum,
 	}
 
-	index, _, _ := kv.rf.Start(op)
+	index, _, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		DPrintf("[Server %d] Get, k=%s - Wrong Leader", kv.me, args.Key)
+		reply.Err = ErrWrongLeader
+		return
+	}
 
 	kv.mu.Lock()
 	indexCh, exist := kv.waitApplyCh[index]
 	if !exist {
-		indexCh = make(chan Op)
-		kv.waitApplyCh[index] = indexCh
+		kv.waitApplyCh[index] = make(chan Op)
+		indexCh = kv.waitApplyCh[index]
 	}
 	kv.mu.Unlock()
 
@@ -87,6 +86,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				reply.Value = ""
 			}
 		} else {
+			DPrintf("[Server %d] Get, k=%s - Not match", kv.me, args.Key)
 			reply.Err = ErrWrongLeader
 		}
 	case <-time.After(Server_Timeout):
@@ -127,15 +127,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s -",
 		kv.me, args.Key, args.Value, args.Op)
 
-	_, isLeader := kv.rf.GetState()
-
-	if !isLeader {
-		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - Wrong Leader",
-			kv.me, args.Key, args.Value, args.Op)
-		reply.Err = ErrWrongLeader
-		return
-	}
-
 	op := Op{
 		Key:         args.Key,
 		Value:       args.Value,
@@ -144,27 +135,36 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		SequenceNum: args.SequenceNum,
 	}
 
-	index, _, _ := kv.rf.Start(op)
+	index, _, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - Wrong Leader",
+			kv.me, args.Key, args.Value, args.Op)
+		reply.Err = ErrWrongLeader
+		return
+	}
 
 	kv.mu.Lock()
 	indexCh, exist := kv.waitApplyCh[index]
 	if !exist {
-		indexCh = make(chan Op)
-		kv.waitApplyCh[index] = indexCh
+		kv.waitApplyCh[index] = make(chan Op)
+		indexCh = kv.waitApplyCh[index]
 	}
 	kv.mu.Unlock()
 
 	select {
 	case commitOp := <-indexCh:
-		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - OK",
-			kv.me, args.Key, args.Value, args.Op)
 		if commitOp.ClientId == op.ClientId && commitOp.SequenceNum == op.SequenceNum {
+			DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - OK",
+				kv.me, args.Key, args.Value, args.Op)
 			reply.Err = OK
 		} else {
+			DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - Not match",
+				kv.me, args.Key, args.Value, args.Op)
 			reply.Err = ErrWrongLeader
 		}
 	case <-time.After(Server_Timeout):
-		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - Wrong Leader",
+		DPrintf("[Server %d] PutAppend, k=%s, v=%s, op=%s - Timeout",
 			kv.me, args.Key, args.Value, args.Op)
 		if kv.isDuplicatedCmd(op.ClientId, op.SequenceNum) {
 			reply.Err = OK
@@ -207,15 +207,22 @@ func (kv *KVServer) applier() {
 		case applyMsg := <-kv.applyCh:
 
 			switch {
+
 			case applyMsg.CommandValid:
 
+				if applyMsg.CommandIndex <= kv.snapshotIndex {
+					return
+				}
+
 				op := applyMsg.Command.(Op)
+
 				if !kv.isDuplicatedCmd(op.ClientId, op.SequenceNum) {
 					switch op.Method {
-					// case "Get":
+
+					case "Get":
 
 					case "Put":
-						DPrintf("[Server %d] Put, apply k=%v, v=%v",
+						DPrintf("[Server %d] Apply Put, k=%v, v=%v",
 							kv.me, op.Key, op.Value)
 
 						kv.mu.Lock()
@@ -223,27 +230,40 @@ func (kv *KVServer) applier() {
 						kv.lastApplySeq[op.ClientId] = op.SequenceNum
 						kv.mu.Unlock()
 					case "Append":
-						DPrintf("[Server %d] Append, apply k=%v, v=%v",
+						DPrintf("[Server %d] Apply Append, k=%v, v=%v",
 							kv.me, op.Key, op.Value)
 
 						kv.mu.Lock()
+						// to-do: impl
 						kv.store[op.Key] += op.Value
 						kv.lastApplySeq[op.ClientId] = op.SequenceNum
 						kv.mu.Unlock()
 					}
 				}
 
+				if kv.maxraftstate != -1 {
+					if kv.rf.RaftStateSize() > kv.maxraftstate {
+						snapshot := kv.CreateSnapshot()
+						kv.rf.Snapshot(applyMsg.CommandIndex, snapshot)
+					}
+				}
 				// reply
 				DPrintf("[Server %d] %v, apply OK",
 					kv.me, op.Method)
 				kv.mu.Lock()
 				indexCh, exist := kv.waitApplyCh[applyMsg.CommandIndex]
-				kv.mu.Unlock()
 				if exist {
 					indexCh <- op
 				}
+				kv.mu.Unlock()
 			case applyMsg.SnapshotValid:
-				DPrintf("[Server %d] snapshot", kv.me)
+				DPrintf("[Server %d] snapshot, apply", kv.me)
+				kv.mu.Lock()
+				if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
+					kv.InstallSnapshot(applyMsg.Snapshot)
+					kv.snapshotIndex = applyMsg.SnapshotIndex
+				}
+				kv.mu.Unlock()
 			}
 		}
 	}
@@ -268,18 +288,23 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
-	kv := &KVServer{}
+	kv := &KVServer{
+		me:            me,
+		maxraftstate:  maxraftstate,
+		applyCh:       make(chan raft.ApplyMsg),
+		store:         make(map[string]string),
+		waitApplyCh:   make(map[int]chan Op),
+		lastApplySeq:  make(map[int64]int64),
+		snapshotIndex: 0,
+	}
 
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	kv.me = me
-	kv.maxraftstate = maxraftstate
-	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.store = make(map[string]string, 1000)
-	kv.waitApplyCh = make(map[int]chan Op, 1000)
-	kv.lastApplySeq = make(map[int64]int64, 1000)
+
+	if persister.SnapshotSize() > 0 {
+		// install snapshot
+		DPrintf("Init Server - Install Snapshot: %d", kv.me)
+		kv.InstallSnapshot(persister.ReadSnapshot())
+	}
 
 	go kv.applier()
 

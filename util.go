@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-const Debug = true
+const Debug = false
 
 const Server_Timeout = 1000 * time.Millisecond
 
