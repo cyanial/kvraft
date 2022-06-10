@@ -28,16 +28,12 @@ func nrand() int64 {
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 
-	ck := &Clerk{}
-
-	// ck.mu.Lock()
-	// defer ck.mu.Unlock()
-
-	ck.servers = servers
-	ck.leaderId = 0
-
-	ck.clientId = nrand()
-	ck.sequenceNum = 0
+	ck := &Clerk{
+		servers:     servers,
+		leaderId:    0,
+		clientId:    nrand(),
+		sequenceNum: 0,
+	}
 
 	DPrintf("Init Clerk: %d", ck.clientId)
 
@@ -78,6 +74,7 @@ func (ck *Clerk) Get(key string) string {
 				return reply.Value
 			}
 		}
+
 		DPrintf("[Client %d, leader=%d] Get, k=%s - Wrong Leader", ck.clientId, leaderId, key)
 		leaderId = ck.changeLeader()
 	}
