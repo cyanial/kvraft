@@ -1,2 +1,2 @@
-github.com/cyanial/raft v0.0.0-20220614004438-60d32d22f3bd h1:UJYQ5qRkC6TyPwrV4U33xv98O8vqhC2z3ijA4UnrGSQ=
-github.com/cyanial/raft v0.0.0-20220614004438-60d32d22f3bd/go.mod h1:VEzfryH55NH8W72AQcxpe0sC165QvPf0lJwFLSWBySY=
+github.com/cyanial/raft v0.0.1 h1:sfx2pjylziiMsEZVngPSftSMv3P78IPx3KuWsJYc+0Q=
+github.com/cyanial/raft v0.0.1/go.mod h1:VEzfryH55NH8W72AQcxpe0sC165QvPf0lJwFLSWBySY=
