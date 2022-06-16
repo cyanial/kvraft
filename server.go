@@ -211,7 +211,7 @@ func (kv *KVServer) applier() {
 			case applyMsg.CommandValid:
 
 				if applyMsg.CommandIndex <= kv.snapshotIndex {
-					break
+					continue
 				}
 
 				op := applyMsg.Command.(Op)
